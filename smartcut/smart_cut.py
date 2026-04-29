@@ -10,6 +10,7 @@ from av.packet import Packet
 from smartcut.media_container import MediaContainer
 from smartcut.media_utils import VideoExportMode
 from smartcut.misc_data import AudioExportInfo, CutSegment
+from smartcut.mp4_fixup import fix_mp4_track_duration
 from smartcut.track_cutters import (
     PassthruAudioCutter,
     SubtitleCutter,
@@ -22,7 +23,7 @@ from smartcut.video_cutter import (
     create_video_output_stream,
 )
 
-__version__ = "1.7"
+__version__ = "1.7.1"
 
 
 class ProgressCallback(Protocol):
@@ -198,6 +199,16 @@ def smart_cut(media_container: MediaContainer, positive_segments: list[tuple[Fra
                     output_av_container.mux(packet)
             if progress is not None:
                 progress.emit(previously_done_segments)
+
+        # Repair last-sample stts delta and track-header durations on MP4
+        # outputs. libavformat's MP4 muxer occasionally writes the final
+        # stts entry with delta=0, leaving mdhd/tkhd/mvhd one frame short
+        # even though every per-sample delta is correct.
+        if cancel_object is None or not cancel_object.cancelled:
+            try:
+                fix_mp4_track_duration(output_path_segment[0])
+            except Exception as fixup_exc:  # pragma: no cover - defensive
+                print(f"mp4 track-duration fixup skipped: {fixup_exc}", flush=True)
 
         if cancel_object is not None and cancel_object.cancelled:
             last_file_path = output_path_segment[0]

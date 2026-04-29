@@ -7,6 +7,11 @@ import av
 from av.container.output import OutputContainer
 from av.packet import Packet
 
+from smartcut.cfr_snap import (
+    CFRInvariantError,
+    assert_cfr_output_invariants,
+    detect_typical_frame_duration_pts,
+)
 from smartcut.media_container import MediaContainer
 from smartcut.media_utils import VideoExportMode
 from smartcut.misc_data import AudioExportInfo, CutSegment
@@ -209,6 +214,30 @@ def smart_cut(media_container: MediaContainer, positive_segments: list[tuple[Fra
                 fix_mp4_track_duration(output_path_segment[0])
             except Exception as fixup_exc:  # pragma: no cover - defensive
                 print(f"mp4 track-duration fixup skipped: {fixup_exc}", flush=True)
+
+            # Defense-in-depth: when the source is CFR, assert that the output
+            # mp4's video track is also CFR. Catches any residual stts non-
+            # uniformity that the snap and the post-write fixup missed.
+            if media_container.video_stream is not None:
+                in_tb = media_container.video_stream.time_base
+                out_tb_attr = getattr(media_container.video_stream, 'time_base', None)
+                typical_in = detect_typical_frame_duration_pts(
+                    getattr(media_container, 'video_frame_times_pts', [])
+                )
+                if typical_in is not None and in_tb is not None and out_tb_attr is not None:
+                    # The output mp4 inherits the input video stream's
+                    # time_base, so the typical delta in output ticks equals
+                    # the input one (1:1 mapping). Guard if that ever changes.
+                    expected_delta_out = typical_in
+                    try:
+                        assert_cfr_output_invariants(
+                            output_path_segment[0], expected_delta_out
+                        )
+                    except CFRInvariantError as cfr_exc:
+                        print(
+                            f"WARNING: smartcut output failed CFR invariants: {cfr_exc}",
+                            flush=True,
+                        )
 
         if cancel_object is not None and cancel_object.cancelled:
             last_file_path = output_path_segment[0]

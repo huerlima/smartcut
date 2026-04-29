@@ -125,11 +125,15 @@ def fix_mp4_track_duration(path: str) -> bool:
             continue
         tkhd_s, _ = tkhd
         tkhd_ver = buf[tkhd_s]
+        # tkhd v0 layout: ver+flags(4) creation(4) modification(4) track_id(4)
+        #                 reserved(4) duration(4) → duration at offset 20.
+        # tkhd v1 layout: ver+flags(4) creation(8) modification(8) track_id(4)
+        #                 reserved(4) duration(8) → duration at offset 28.
         if tkhd_ver == 0:
-            tkhd_dur_off = tkhd_s + 24
+            tkhd_dur_off = tkhd_s + 20
             tkhd_dur_sz = 4
         else:
-            tkhd_dur_off = tkhd_s + 32
+            tkhd_dur_off = tkhd_s + 28
             tkhd_dur_sz = 8
 
         # mdia → mdhd, minf/stbl/stts

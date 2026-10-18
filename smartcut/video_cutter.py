@@ -301,6 +301,15 @@ class VideoCutter:
         # current frame index) leaves gaps in the DTS sequence that the mp4
         # muxer turns into non-uniform stts entries.
         self._cfr_decode_index: int = 0
+        self._cfr_decode_start: int | None = None
+        self._cfr_reorder_delay: int | None = None
+        source_pts = getattr(media_container, 'video_frame_times_pts', [])
+        source_dts = getattr(media_container, 'gop_start_times_dts', [])
+        if self._typical_frame_duration_out_pts is not None and len(source_pts) and len(source_dts):
+            first_dts = int(source_dts[0])
+            delay = (int(source_pts[0]) - first_dts) * self.in_time_base / self.out_time_base
+            if -900_000 <= first_dts <= 1_000_000_000_000 and delay >= 0 and delay.denominator == 1:
+                self._cfr_reorder_delay = int(delay)
 
         # Output position state - can be set for joining multiple files
         self.last_dts = initial_last_dts
@@ -415,6 +424,24 @@ class VideoCutter:
         if packet.dts is not None and (packet.dts < -900_000 or packet.dts > 1_000_000_000_000):
             packet.dts = None
 
+        typical = self._typical_frame_duration_out_pts
+        if typical is not None and self._cfr_reorder_delay is not None and packet.pts is not None:
+            if self._cfr_decode_start is None:
+                if self.last_dts != -100_000_000:
+                    self._cfr_decode_start = self.last_dts + typical
+                else:
+                    source_start = int(packet.pts) - self._cfr_reorder_delay
+                    self._cfr_decode_start = min(source_start, int(packet.dts)) if packet.dts is not None else source_start
+            decode_time = self._cfr_decode_start + self._cfr_decode_index * typical
+            if decode_time > packet.pts:
+                raise RuntimeError('CFR decode grid exceeds packet presentation time')
+            packet.dts = decode_time
+            packet.duration = typical
+            self.last_dts = decode_time
+            self.typical_frame_duration = typical
+            self._cfr_decode_index += 1
+            return
+
         if packet.dts is not None:
             if packet.dts <= self.last_dts:
                 packet.dts = self.last_dts + 1
@@ -501,14 +528,9 @@ class VideoCutter:
         independently, so B-frames whose encoder batches span the
         recode/flush boundary are still placed correctly.
 
-        DTS handling: the encoder emits packets in decode order with its
-        own internal DTS scale, which generally does not align with the
-        grid the prior remux segment ended on. We therefore rewrite each
-        recoded packet's DTS to ``last_dts + (i+1) * typical_delta`` so
-        the DTS sequence across the copy<->transcode seam is continuous.
-        Without this, the mp4 muxer turns the gap into a non-uniform
-        stts entry (e.g. ``(1, 3*typical)`` between the last copy frame
-        and the first transcoded frame).
+        DTS handling preserves the encoder's decode delay. Moving leading
+        DTS values to zero overlaps the following copied B-frame packets;
+        the monotonicity guard then compresses those intervals to one tick.
 
         Re-raises any RuntimeError from the underlying snap helper so a
         suspicious mismatch aborts the cut rather than producing silently
@@ -526,18 +548,6 @@ class VideoCutter:
         result = snap_recoded_packets_to_grid(packets, typical_out, anchor)
         if result is None:
             return
-
-        # Rewrite DTSes to continue sequentially after the last packet
-        # already muxed, closing any seam gap.
-        base = int(self.last_dts) if self.last_dts is not None and self.last_dts >= 0 else -typical_out
-        for i, packet in enumerate(packets):
-            new_dts = base + (i + 1) * typical_out
-            packet.dts = new_dts
-            # Preserve PTS >= DTS for muxers that require it.
-            if packet.pts is not None and int(packet.pts) < new_dts:
-                packet.pts = new_dts
-            packet.duration = typical_out
-        # END DTS rewrite
 
         self._snap_total_emitted += result.snapped
         if result.max_correction > 0:

@@ -44,3 +44,6 @@ smartcut_cpp
 AGENTS.md
 CLAUDE.md
 .claude
+
+*.history
+.history.*

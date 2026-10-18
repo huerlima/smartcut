@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from fractions import Fraction
 from typing import cast
 
+import logging
+
 import av
 import av.bitstream
 from av import VideoCodecContext, VideoStream
@@ -14,10 +16,16 @@ from av.packet import Packet
 from av.stream import Disposition
 from av.video.frame import PictureType, VideoFrame
 
+from smartcut.cfr_snap import (
+    detect_typical_frame_duration_pts,
+    snap_recoded_packets_to_grid,
+)
 from smartcut.media_container import MediaContainer
 from smartcut.media_utils import VideoExportMode, VideoExportQuality, get_crf_for_quality
 from smartcut.misc_data import CutSegment
 from smartcut.nal_tools import get_h265_nal_unit_type, is_leading_picture_nal_type
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -252,6 +260,48 @@ class VideoCutter:
         # packets without proper duration cause last-frame discard issues
         self.typical_frame_duration: int | None = None
 
+        # Detect CFR source. If the input has a uniform inter-frame PTS delta
+        # we use it to snap re-encoded packet PTS/DTS onto that grid at the
+        # copy<->transcode seam, so the output container reports a canonical
+        # avg_frame_rate instead of falsely advertising VFR.
+        # Only mp4-family containers need this: the bug is in libavformat's
+        # mp4 muxer building stts from packet.duration/dts deltas. mkv/webm
+        # store explicit per-block durations and are unaffected; applying the
+        # CFR override there breaks legitimate per-packet timing.
+        out_format_name = (output_av_container.format.name or '').lower() if output_av_container.format else ''
+        is_mp4_family = any(
+            tag in out_format_name for tag in ('mp4', 'mov', 'm4a', 'm4v', '3gp', '3g2', 'mj2', 'ipod')
+        )
+        self._typical_frame_duration_in_pts: int | None = (
+            detect_typical_frame_duration_pts(getattr(media_container, 'video_frame_times_pts', []))
+            if is_mp4_family else None
+        )
+        if self._typical_frame_duration_in_pts is not None:
+            ratio = self.in_time_base / self.out_time_base
+            typical_out = self._typical_frame_duration_in_pts * ratio
+            # Must be an exact integer in the output time_base; otherwise we
+            # cannot snap losslessly and disable the snap to avoid silent
+            # corruption.
+            if typical_out.denominator == 1 and int(typical_out) > 0:
+                self._typical_frame_duration_out_pts: int | None = int(typical_out)
+            else:
+                self._typical_frame_duration_out_pts = None
+        else:
+            self._typical_frame_duration_out_pts = None
+        # Total number of recoded packets we have already snapped onto the
+        # output grid. Used as the per-batch rank offset when consecutive
+        # encoder-output batches (e.g. recode_segment then a later flush)
+        # belong to the same CFR run.
+        self._snap_total_emitted: int = 0
+
+        # Decode-order packet counter, used to assign uniform DTSes when CFR
+        # is detected. Without this override, the seam between copy-mode
+        # (DTSes inherited from source, possibly negative for leading B-frames)
+        # and transcode-mode (DTSes from a fresh encoder starting at the
+        # current frame index) leaves gaps in the DTS sequence that the mp4
+        # muxer turns into non-uniform stts entries.
+        self._cfr_decode_index: int = 0
+
         # Output position state - can be set for joining multiple files
         self.last_dts = initial_last_dts
         self.segment_start_in_output = initial_position
@@ -388,9 +438,18 @@ class VideoCutter:
                 packet.dts = self.last_dts + 1
             self.last_dts = packet.dts
 
-        # Fix packet duration - needed by MP4 muxer to output valid frames
-        # Track typical duration from valid packets, use it when duration is missing/zero
-        if packet.duration is not None and packet.duration > 0:
+        # Fix packet duration - needed by MP4 muxer to output valid frames.
+        # When the source is detected as CFR (mp4-only), force every packet's
+        # duration to the typical delta. The mp4 muxer's stts table is built
+        # from packet.duration, so a single packet with duration != typical
+        # (e.g. carried over from a remux GOP boundary) would otherwise produce
+        # a non-uniform stts entry that leaks the seam between copy and
+        # transcode segments.
+        cfr_typical = self._typical_frame_duration_out_pts
+        if cfr_typical is not None and cfr_typical > 0:
+            packet.duration = cfr_typical
+            self.typical_frame_duration = cfr_typical
+        elif packet.duration is not None and packet.duration > 0:
             self.typical_frame_duration = packet.duration
         elif self.typical_frame_duration is not None:
             packet.duration = self.typical_frame_duration
@@ -432,18 +491,80 @@ class VideoCutter:
         self.enc_last_pts = -1
         self.enc_codec = enc_codec
 
+    def _maybe_snap_recoded_packets(self, packets: list[Packet]) -> None:
+        """Snap encoder-output packet PTS/DTS to the source CFR grid.
+
+        Active only when the source was detected as CFR and the typical
+        frame duration converts cleanly into the output time_base.
+
+        PTS handling: each packet is rounded to the nearest grid point
+        independently, so B-frames whose encoder batches span the
+        recode/flush boundary are still placed correctly.
+
+        DTS handling: the encoder emits packets in decode order with its
+        own internal DTS scale, which generally does not align with the
+        grid the prior remux segment ended on. We therefore rewrite each
+        recoded packet's DTS to ``last_dts + (i+1) * typical_delta`` so
+        the DTS sequence across the copy<->transcode seam is continuous.
+        Without this, the mp4 muxer turns the gap into a non-uniform
+        stts entry (e.g. ``(1, 3*typical)`` between the last copy frame
+        and the first transcoded frame).
+
+        Re-raises any RuntimeError from the underlying snap helper so a
+        suspicious mismatch aborts the cut rather than producing silently
+        broken output.
+        """
+        if not packets:
+            return
+        typical_out = self._typical_frame_duration_out_pts
+        if typical_out is None:
+            return
+
+        # Anchor the PTS grid at 0 in output ticks. Smartcut writes pts as
+        # frame_idx * typical, so 0 is always a valid grid origin.
+        anchor = 0
+        result = snap_recoded_packets_to_grid(packets, typical_out, anchor)
+        if result is None:
+            return
+
+        # Rewrite DTSes to continue sequentially after the last packet
+        # already muxed, closing any seam gap.
+        base = int(self.last_dts) if self.last_dts is not None and self.last_dts >= 0 else -typical_out
+        for i, packet in enumerate(packets):
+            new_dts = base + (i + 1) * typical_out
+            packet.dts = new_dts
+            # Preserve PTS >= DTS for muxers that require it.
+            if packet.pts is not None and int(packet.pts) < new_dts:
+                packet.pts = new_dts
+            packet.duration = typical_out
+        # END DTS rewrite
+
+        self._snap_total_emitted += result.snapped
+        if result.max_correction > 0:
+            logger.info(
+                "snapped %d recoded packet(s) to CFR grid: typical_delta=%d max_correction=%d",
+                result.snapped, result.typical_delta, result.max_correction,
+            )
+
     def segment(self, cut_segment: CutSegment) -> list[Packet]:
         if cut_segment.require_recode:
             packets = self.recode_segment(cut_segment)
+            self._maybe_snap_recoded_packets(packets)
         elif self._should_hybrid_recode_cra(cut_segment):
             # CRA GOP with leading pictures: recode leading pics, remux rest
             # Don't flush encoder - leading frames continue into existing encoder
             packets = self.hybrid_recode_cra_segment(cut_segment)
+            # NOTE: hybrid output mixes encoder and remux packets in one list;
+            # snapping the whole batch would corrupt remux PTS, so we skip the
+            # CFR snap for this path. The smartcut bug this targets does not
+            # exercise the hybrid CRA code path.
             # Update tracking variables (same as remux path)
             self.last_remuxed_segment_gop_index = cut_segment.gop_index
             self.is_first_remuxed_segment = False
         else:
-            packets = self.flush_encoder()
+            flushed = self.flush_encoder()
+            self._maybe_snap_recoded_packets(flushed)
+            packets = flushed
             packets.extend(self.remux_segment(cut_segment))
             # Update tracking variables for hybrid CRA recoding
             self.last_remuxed_segment_gop_index = cut_segment.gop_index
@@ -458,6 +579,7 @@ class VideoCutter:
 
     def finish(self) -> list[Packet]:
         packets = self.flush_encoder()
+        self._maybe_snap_recoded_packets(packets)
         for packet in packets:
             self._fix_packet_timestamps(packet)
 

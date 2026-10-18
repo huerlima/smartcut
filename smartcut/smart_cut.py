@@ -7,9 +7,15 @@ import av
 from av.container.output import OutputContainer
 from av.packet import Packet
 
+from smartcut.cfr_snap import (
+    CFRInvariantError,
+    assert_cfr_output_invariants,
+    detect_typical_frame_duration_pts,
+)
 from smartcut.media_container import MediaContainer
 from smartcut.media_utils import VideoExportMode
 from smartcut.misc_data import AudioExportInfo, CutSegment
+from smartcut.mp4_fixup import fix_mp4_track_duration
 from smartcut.track_cutters import (
     PassthruAudioCutter,
     SubtitleCutter,
@@ -22,7 +28,7 @@ from smartcut.video_cutter import (
     create_video_output_stream,
 )
 
-__version__ = "1.7"
+__version__ = "1.7.2"
 
 
 class ProgressCallback(Protocol):
@@ -198,6 +204,40 @@ def smart_cut(media_container: MediaContainer, positive_segments: list[tuple[Fra
                     output_av_container.mux(packet)
             if progress is not None:
                 progress.emit(previously_done_segments)
+
+        # Repair last-sample stts delta and track-header durations on MP4
+        # outputs. libavformat's MP4 muxer occasionally writes the final
+        # stts entry with delta=0, leaving mdhd/tkhd/mvhd one frame short
+        # even though every per-sample delta is correct.
+        if cancel_object is None or not cancel_object.cancelled:
+            try:
+                fix_mp4_track_duration(output_path_segment[0])
+            except Exception as fixup_exc:  # pragma: no cover - defensive
+                print(f"mp4 track-duration fixup skipped: {fixup_exc}", flush=True)
+
+            # Defense-in-depth: when the source is CFR, assert that the output
+            # mp4's video track is also CFR. Catches any residual stts non-
+            # uniformity that the snap and the post-write fixup missed.
+            if media_container.video_stream is not None:
+                in_tb = media_container.video_stream.time_base
+                out_tb_attr = getattr(media_container.video_stream, 'time_base', None)
+                typical_in = detect_typical_frame_duration_pts(
+                    getattr(media_container, 'video_frame_times_pts', [])
+                )
+                if typical_in is not None and in_tb is not None and out_tb_attr is not None:
+                    # The output mp4 inherits the input video stream's
+                    # time_base, so the typical delta in output ticks equals
+                    # the input one (1:1 mapping). Guard if that ever changes.
+                    expected_delta_out = typical_in
+                    try:
+                        assert_cfr_output_invariants(
+                            output_path_segment[0], expected_delta_out
+                        )
+                    except CFRInvariantError as cfr_exc:
+                        print(
+                            f"WARNING: smartcut output failed CFR invariants: {cfr_exc}",
+                            flush=True,
+                        )
 
         if cancel_object is not None and cancel_object.cancelled:
             last_file_path = output_path_segment[0]

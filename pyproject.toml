@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smartcut"
-version = "1.7"
+version = "1.7.2"
 description = "CLI tool for efficient video cutting with minimal recoding"
 readme = "README.md"
 requires-python = ">=3.11"

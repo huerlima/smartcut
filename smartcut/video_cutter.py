@@ -498,6 +498,9 @@ class VideoCutter:
             enc_codec.rate = muxing_codec.rate
         enc_codec.options.update(self.encoding_options)
 
+        if self._cfr_reorder_delay == 0 and not self.in_stream.codec_context.has_b_frames:
+            enc_codec.max_b_frames = 0
+
         # Leaving this here for future consideration: manually setting the bframe count seems to make sense in principle.
         # But atleast in the test suite, it seemed to cause more issues that in solves.
         # metadata_b_frames = max(self.in_stream.codec_context.max_b_frames, 1 if self.in_stream.codec_context.has_b_frames else 0)

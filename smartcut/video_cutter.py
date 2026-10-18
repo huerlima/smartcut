@@ -301,6 +301,15 @@ class VideoCutter:
         # current frame index) leaves gaps in the DTS sequence that the mp4
         # muxer turns into non-uniform stts entries.
         self._cfr_decode_index: int = 0
+        self._cfr_decode_start: int | None = None
+        self._cfr_reorder_delay: int | None = None
+        source_pts = getattr(media_container, 'video_frame_times_pts', [])
+        source_dts = getattr(media_container, 'gop_start_times_dts', [])
+        if self._typical_frame_duration_out_pts is not None and len(source_pts) and len(source_dts):
+            first_dts = int(source_dts[0])
+            delay = (int(source_pts[0]) - first_dts) * self.in_time_base / self.out_time_base
+            if -900_000 <= first_dts <= 1_000_000_000_000 and delay >= 0 and delay.denominator == 1:
+                self._cfr_reorder_delay = int(delay)
 
         # Output position state - can be set for joining multiple files
         self.last_dts = initial_last_dts
@@ -414,6 +423,24 @@ class VideoCutter:
         #      https://github.com/PyAV-Org/PyAV/discussions/933
         if packet.dts is not None and (packet.dts < -900_000 or packet.dts > 1_000_000_000_000):
             packet.dts = None
+
+        typical = self._typical_frame_duration_out_pts
+        if typical is not None and self._cfr_reorder_delay is not None and packet.pts is not None:
+            if self._cfr_decode_start is None:
+                if self.last_dts != -100_000_000:
+                    self._cfr_decode_start = self.last_dts + typical
+                else:
+                    source_start = int(packet.pts) - self._cfr_reorder_delay
+                    self._cfr_decode_start = min(source_start, int(packet.dts)) if packet.dts is not None else source_start
+            decode_time = self._cfr_decode_start + self._cfr_decode_index * typical
+            if decode_time > packet.pts:
+                raise RuntimeError('CFR decode grid exceeds packet presentation time')
+            packet.dts = decode_time
+            packet.duration = typical
+            self.last_dts = decode_time
+            self.typical_frame_duration = typical
+            self._cfr_decode_index += 1
+            return
 
         if packet.dts is not None:
             if packet.dts <= self.last_dts:

@@ -130,6 +130,33 @@ short_h264_path = 'short_h264.mkv'
 short_h265_path = 'short_h265.mkv'
 
 
+def test_cfr_recode_preserves_decode_delay() -> None:
+    from types import SimpleNamespace
+
+    from smartcut.video_cutter import VideoCutter
+
+    cutter = VideoCutter.__new__(VideoCutter)
+    cutter.out_stream = None
+    cutter.out_time_base = Fraction(1, 30000)
+    cutter.last_dts = -100_000_000
+    cutter._typical_frame_duration_out_pts = 1001
+    cutter.typical_frame_duration = None
+    cutter._snap_total_emitted = 0
+    recoded = [SimpleNamespace(pts=0, dts=-2002, duration=1001),
+               SimpleNamespace(pts=1001, dts=-1001, duration=1001)]
+    cutter._maybe_snap_recoded_packets(recoded)
+    for packet in recoded:
+        cutter._fix_packet_timestamps(packet)
+    copied = [SimpleNamespace(pts=2002, dts=0, duration=1001),
+              SimpleNamespace(pts=6006, dts=1001, duration=1001)]
+    for packet in copied:
+        cutter._fix_packet_timestamps(packet)
+    packets = recoded + copied
+    assert [packet.pts for packet in packets] == [0, 1001, 2002, 6006]
+    assert [packet.dts for packet in packets] == [-2002, -1001, 0, 1001]
+    assert all(packet.duration == 1001 for packet in packets)
+
+
 def test_h264_cut_on_keyframes() -> None:
     create_test_video(short_h264_path, 30, 'h264', 'yuv420p', 30, (32, 18))
     output_path = test_h264_cut_on_keyframes.__name__ + '.mkv'
@@ -1417,6 +1444,7 @@ def get_test_categories() -> dict[str, list]:
     test_categories = {
         # Core synthetic test categories (generated test videos)
         'basic': [
+            test_cfr_recode_preserves_decode_delay,
             test_h264_cut_on_keyframes,
             test_h264_smart_cut,
             test_mp4_cut_on_keyframe,

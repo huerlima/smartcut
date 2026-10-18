@@ -501,14 +501,9 @@ class VideoCutter:
         independently, so B-frames whose encoder batches span the
         recode/flush boundary are still placed correctly.
 
-        DTS handling: the encoder emits packets in decode order with its
-        own internal DTS scale, which generally does not align with the
-        grid the prior remux segment ended on. We therefore rewrite each
-        recoded packet's DTS to ``last_dts + (i+1) * typical_delta`` so
-        the DTS sequence across the copy<->transcode seam is continuous.
-        Without this, the mp4 muxer turns the gap into a non-uniform
-        stts entry (e.g. ``(1, 3*typical)`` between the last copy frame
-        and the first transcoded frame).
+        DTS handling preserves the encoder's decode delay. Moving leading
+        DTS values to zero overlaps the following copied B-frame packets;
+        the monotonicity guard then compresses those intervals to one tick.
 
         Re-raises any RuntimeError from the underlying snap helper so a
         suspicious mismatch aborts the cut rather than producing silently
@@ -526,18 +521,6 @@ class VideoCutter:
         result = snap_recoded_packets_to_grid(packets, typical_out, anchor)
         if result is None:
             return
-
-        # Rewrite DTSes to continue sequentially after the last packet
-        # already muxed, closing any seam gap.
-        base = int(self.last_dts) if self.last_dts is not None and self.last_dts >= 0 else -typical_out
-        for i, packet in enumerate(packets):
-            new_dts = base + (i + 1) * typical_out
-            packet.dts = new_dts
-            # Preserve PTS >= DTS for muxers that require it.
-            if packet.pts is not None and int(packet.pts) < new_dts:
-                packet.pts = new_dts
-            packet.duration = typical_out
-        # END DTS rewrite
 
         self._snap_total_emitted += result.snapped
         if result.max_correction > 0:

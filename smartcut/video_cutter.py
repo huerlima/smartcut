@@ -434,7 +434,12 @@ class VideoCutter:
                     self._cfr_decode_start = min(source_start, int(packet.dts)) if packet.dts is not None else source_start
             decode_time = self._cfr_decode_start + self._cfr_decode_index * typical
             if decode_time > packet.pts:
-                raise RuntimeError('CFR decode grid exceeds packet presentation time')
+                raise RuntimeError(
+                    f'CFR decode grid exceeds packet presentation time: pts={packet.pts}, '
+                    f'input_dts={packet.dts}, decode_time={decode_time}, '
+                    f'index={self._cfr_decode_index}, origin={self._cfr_decode_start}, '
+                    f'step={typical}, source_delay={self._cfr_reorder_delay}'
+                )
             packet.dts = decode_time
             packet.duration = typical
             self.last_dts = decode_time
@@ -492,6 +497,9 @@ class VideoCutter:
         if muxing_codec.rate is not None:
             enc_codec.rate = muxing_codec.rate
         enc_codec.options.update(self.encoding_options)
+
+        if self._cfr_reorder_delay == 0 and not self.in_stream.codec_context.has_b_frames:
+            enc_codec.max_b_frames = 0
 
         # Leaving this here for future consideration: manually setting the bframe count seems to make sense in principle.
         # But atleast in the test suite, it seemed to cause more issues that in solves.

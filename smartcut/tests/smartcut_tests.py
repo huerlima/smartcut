@@ -169,6 +169,31 @@ def test_cfr_recode_preserves_decode_delay() -> None:
         assert invalid.pts == 0
 
 
+def test_h264_cfr_no_b_frames_boundary_flush() -> None:
+    source_path = 'cfr_no_b_frames_source.mp4'
+    rate = Fraction(30000, 1001)
+    subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+        'testsrc2=size=64x36:rate=30000/1001', '-frames:v', '300', '-c:v', 'libx264',
+        '-threads', '2', '-g', '30', '-bf', '0', '-sc_threshold', '0',
+        '-video_track_timescale', '30000', source_path], check=True)
+    for start_frame, end_frame in ((30, 250), (29, 184)):
+        source = MediaContainer(source_path)
+        output_path = f'cfr_no_b_frames_{start_frame}_{end_frame}.mp4'
+        smart_cut(source, [(start_frame / rate, end_frame / rate)], output_path, log_level='warning')
+        expected = end_frame - start_frame
+        with av_open(output_path) as container:
+            stream = container.streams.video[0]
+            assert stream.average_rate == rate
+            assert stream.frames == expected
+            packets = [packet for packet in container.demux(stream) if packet.size]
+            expected_times = [Fraction(index, 1) / rate for index in range(expected)]
+            assert [packet.pts * packet.time_base for packet in packets] == expected_times
+            assert [packet.dts * packet.time_base for packet in packets] == expected_times
+            assert all(packet.duration * packet.time_base == 1 / rate for packet in packets)
+        with av_open(output_path) as container:
+            assert sum(1 for _frame in container.decode(video=0)) == expected
+
+
 def test_h264_cut_on_keyframes() -> None:
     create_test_video(short_h264_path, 30, 'h264', 'yuv420p', 30, (32, 18))
     output_path = test_h264_cut_on_keyframes.__name__ + '.mkv'
